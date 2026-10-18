@@ -1,5 +1,6 @@
 import java.time.LocalDate
 import org.springframework.boot.gradle.tasks.run.BootRun
+import org.springframework.boot.gradle.tasks.bundling.BootJar
 import org.gradle.language.jvm.tasks.ProcessResources
 
 plugins {
@@ -61,6 +62,10 @@ dependencies {
 }
 
 tasks.test { useJUnitPlatform() }
+
+tasks.named<BootJar>("bootJar") {
+    archiveFileName.set("get-jobs.jar")
+}
 
 // 显示已过时 API 的详细告警，便于定位并修复
 tasks.withType<JavaCompile> {

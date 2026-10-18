@@ -51,8 +51,14 @@ public class BossConfigEntity {
     private String repeatChatMessages;
     /** 是否过滤不在线HR（1=启用，0=关闭） */
     private Integer filterDeadHr;
-    /** HR不在线状态列表（逗号或括号列表） */
+    /** HR不在线状态列表（逗号或括号列表），黑名单：命中即跳过 */
     private String deadStatus;
+    /**
+     * HR 活跃度白名单（括号列表）。非空时优先级最高：只有命中其中一项的 HR 才投递，
+     * 未命中（包括抓取失败的空值）一律跳过。
+     * 例：[刚刚活跃,今日活跃,3日内活跃,本周活跃] = 只投 1 周内活跃的 HR。
+     */
+    private String hrActiveKeep;
     /** 创建时间 */
     private LocalDateTime createdAt;
     /** 更新时间 */

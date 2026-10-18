@@ -4,6 +4,8 @@ import type { NextConfig } from "next";
 const serverConfig = require('./server.config.js');
 
 const nextConfig: NextConfig = {
+  // 本机构建限制并行度，避免静态导出同时占满 CPU。
+  experimental: { cpus: 2 },
   // 将API配置暴露给客户端
   env: {
     API_BASE_URL: serverConfig.api.baseUrl,

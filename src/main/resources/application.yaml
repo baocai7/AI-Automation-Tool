@@ -28,6 +28,22 @@ spring:
 server:
   port: 9527  # 后端 API 固定端口（别用 9679：落在 Windows Hyper-V 保留段 9628-9727 里，绑不上）
 
+automation:
+  login-check:
+    logged-in-interval-ms: 30000  # 已登录后减少 DOM 检测；扫码期间仍每 3 秒检测
+
+# 启动时自动唤起积分客户端并领取每日奖励。
+# WorkBuddy 使用 Electron CDP + Playwright 连接客户端页面，不需要 macOS“辅助功能”权限。
+reward-claim:
+  enabled: true
+  workbuddy:
+    enabled: true
+    cdp-automation: true
+    cdp-port: 9229
+  qoder:
+    enabled: true
+  close-after-confirmed: true
+
 # 日志配置
 logging:
   level:

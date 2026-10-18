@@ -55,6 +55,18 @@ public class Boss {
     private Set<String> blackCompanies;
     private Set<String> blackRecruiters;
     private Set<String> blackJobs;
+    /**
+     * 职位相关性白名单：命中其中任意一个词才允许投递。
+     * 数据来源 boss_blacklist 表 type='job_white'（复用黑名单表，避免新增表）。
+     * 为空表示不启用，行为与改动前完全一致。
+     */
+    private Set<String> jobWhiteWords;
+    /**
+     * 职位描述（JD）排除词：命中任意一个就不投递。
+     * 数据来源 boss_blacklist 表 type='job_jd_black'。为空表示不启用。
+     * 用途：在 AI 不可用（未配 API_KEY）时，仍能拦住「要求 3 年以上」「社招」这类岗位。
+     */
+    private Set<String> jobJdBlackWords;
     // 记录 encryptId -> encryptUserId 的映射，用于后续更新投递状态
     private final ConcurrentMap<String, String> encryptIdToUserId = new ConcurrentHashMap<>();
     @Setter
@@ -97,11 +109,25 @@ public class Boss {
         this.blackCompanies = bossService.getBlackCompanies();
         this.blackRecruiters = bossService.getBlackRecruiters();
         this.blackJobs = bossService.getBlackJobs();
+        // 职位相关性白名单（type='job_white'），为空则不启用
+        try {
+            this.jobWhiteWords = bossService.getBlacklistByType("job_white");
+        } catch (Throwable ignore) {
+            this.jobWhiteWords = java.util.Collections.emptySet();
+        }
+        // JD 排除词（type='job_jd_black'），为空则不启用
+        try {
+            this.jobJdBlackWords = bossService.getBlacklistByType("job_jd_black");
+        } catch (Throwable ignore) {
+            this.jobJdBlackWords = java.util.Collections.emptySet();
+        }
 
-        log.info("黑名单加载完成: 公司({}) 招聘者({}) 职位({})",
+        log.info("黑名单加载完成: 公司({}) 招聘者({}) 职位({}) 职位白名单({}) JD排除词({})",
                 blackCompanies != null ? blackCompanies.size() : 0,
                 blackRecruiters != null ? blackRecruiters.size() : 0,
-                blackJobs != null ? blackJobs.size() : 0);
+                blackJobs != null ? blackJobs.size() : 0,
+                jobWhiteWords != null ? jobWhiteWords.size() : 0,
+                jobJdBlackWords != null ? jobJdBlackWords.size() : 0);
         // 不在页面初始化阶段入库，仅用于后续点击卡片时按需入库
     }
 
@@ -222,6 +248,292 @@ public class Boss {
         result.put("blackRecruiters", new HashSet<>(blackRecruiters != null ? blackRecruiters : Collections.emptySet()));
         result.put("blackJobs", new HashSet<>(blackJobs != null ? blackJobs : Collections.emptySet()));
         return result;
+    }
+
+    /** A verified message from the opened conversation, independent of read/unread state. */
+    public record ChatSnapshot(String sessionTitle, String lastMessage, String stateKey,
+                               String messageId, boolean fromSelf, String context) {
+        public ChatSnapshot(String sessionTitle, String lastMessage, String stateKey) {
+            this(sessionTitle, lastMessage, stateKey, null, false, "");
+        }
+
+        public ChatSnapshot(String sessionTitle, String lastMessage) {
+            this(sessionTitle, lastMessage, sessionTitle);
+        }
+
+        public String seenKey() {
+            return messageId == null ? lastMessage : "v2:" + messageId;
+        }
+    }
+
+    public int autoReplyUnread(java.util.function.Function<ChatSnapshot, String> decider, int maxCount) {
+        return autoReplyUnread(decider, maxCount, (snapshot, reply) -> {});
+    }
+
+    /** Only acknowledge state after the sent bubble is confirmed in this exact conversation. */
+    public int autoReplyUnread(java.util.function.Function<ChatSnapshot, String> decider, int maxCount,
+                               java.util.function.BiConsumer<ChatSnapshot, String> onSent) {
+        return autoReplyUnread(decider, maxCount, onSent, List.of(), snapshot -> {},
+                (snapshot, reply) -> {}, snapshot -> false);
+    }
+
+    public int autoReplyUnread(java.util.function.Function<ChatSnapshot, String> decider, int maxCount,
+            java.util.function.BiConsumer<ChatSnapshot, String> onSent, List<ChatSnapshot> pending,
+            java.util.function.Consumer<ChatSnapshot> onObserved,
+            java.util.function.BiConsumer<ChatSnapshot, String> onFailed,
+            java.util.function.Predicate<ChatSnapshot> retryCurrent) {
+        if (decider == null || maxCount <= 0) return 0;
+        if (!page.url().contains("/web/geek/chat")) {
+            page.navigate("https://www.zhipin.com/web/geek/chat");
+        }
+        PlaywrightUtil.sleep(3);
+
+        int replied = 0;
+        // A previously opened unread conversation may already have disappeared from the unread list.
+        // Retry only an exact persisted incoming message still visible in the current pane.
+        if (!pending.isEmpty()) {
+            JSONObject current = BossChatReader.message(page);
+            for (ChatSnapshot saved : pending) {
+                String selected = current.optString("selectedKey");
+                if (!current.optBoolean("found") || current.optBoolean("self")
+                        || (!selected.isEmpty() && !selected.equals(saved.stateKey()))
+                        || !saved.messageId().equals(current.optString("identity"))) continue;
+                BossChatReader.Session session = new BossChatReader.Session(saved.sessionTitle(), saved.stateKey());
+                ChatSnapshot verified = BossChatReader.snapshot(session, current);
+                log.info("自动回复：重试原未读待回复会话 | 会话：{}", saved.sessionTitle());
+                String reply = decider.apply(verified);
+                if (reply == null || reply.isBlank()) {
+                    if (retryCurrent.test(verified)) return 0;
+                } else if (sendReplyToOpenSession(session, verified, reply)) {
+                    onSent.accept(verified, reply);
+                    replied++;
+                } else {
+                    onFailed.accept(verified, reply);
+                    return 0;
+                }
+                break;
+            }
+        }
+        if (replied >= maxCount) return replied;
+        if (!selectUnreadConversations()) return replied;
+        List<BossChatReader.Session> sessions = new ArrayList<>();
+        Map<String, Integer> counts = new HashMap<>();
+        Locator items = page.locator(Locators.CHAT_LIST_ITEM);
+        for (int i = 0; i < items.count(); i++) {
+            try {
+                BossChatReader.Session session = BossChatReader.session(items.nth(i));
+                if (session.title().isBlank() || session.key().isBlank()) continue;
+                sessions.add(session);
+                counts.merge(session.key(), 1, Integer::sum);
+            } catch (Exception e) {
+                log.warn("自动回复：读取第 {} 个会话失败：{}", i, e.getMessage());
+            }
+        }
+        log.info("自动回复：扫描到 {} 个未读会话（仅未读模式）", sessions.size());
+        int unreadable = 0;
+        int failed = 0;
+        for (BossChatReader.Session session : sessions) {
+            if (replied >= maxCount) break;
+            if (counts.get(session.key()) != 1) {
+                unreadable++;
+                log.warn("自动回复：会话身份重复，无法安全区分 HR，跳过 | 会话：{}", session.title());
+                continue;
+            }
+            try {
+                if (!openReplySession(session)) {
+                    unreadable++;
+                    continue;
+                }
+                JSONObject current = readStableChatMessage(session);
+                if (current == null) {
+                    unreadable++;
+                    log.warn("自动回复：未读到稳定的聊天记录，稍后重试 | 会话：{}", session.title());
+                    continue;
+                }
+                ChatSnapshot snapshot = BossChatReader.snapshot(session, current);
+                onObserved.accept(snapshot);
+                String reply = decider.apply(snapshot);
+                if (reply == null || reply.isBlank()) {
+                    if (retryCurrent.test(snapshot)) break;
+                    continue;
+                }
+                if (sendReplyToOpenSession(session, snapshot, reply)) {
+                    replied++;
+                    onSent.accept(snapshot, reply);
+                } else {
+                    failed++;
+                    onFailed.accept(snapshot, reply);
+                    // Keep the pane open for retry after the unread badge disappears.
+                    break;
+                }
+            } catch (Exception e) {
+                failed++;
+                log.warn("自动回复：会话处理失败，保留待回复状态 | 会话：{}", session.title(), e);
+            }
+        }
+        log.info("自动回复页面检查完成：发送 {} 条，无法识别 {} 个，失败/消息变化 {} 个", replied, unreadable, failed);
+        return replied;
+    }
+
+    static final java.util.regex.Pattern UNREAD_TAB_TEXT = java.util.regex.Pattern.compile(
+            "^未读(?:\\s*[（(]?\\s*\\d+\\+?\\s*[）)]?)?$");
+
+    boolean selectUnreadConversations() {
+        Locator tabs = page.getByText(UNREAD_TAB_TEXT);
+        // SPA 切回聊天页时，筛选栏可能晚于文档导航完成；等待有界，不持续刷新页面。
+        for (int attempt = 0; attempt < 5 && tabs.count() == 0; attempt++) {
+            PlaywrightUtil.sleep(1);
+        }
+        Locator unread = null;
+        for (int i = 0; i < tabs.count(); i++) {
+            Locator candidate = tabs.nth(i);
+            if (!candidate.isVisible()) continue;
+            boolean headerTab = Boolean.TRUE.equals(candidate.evaluate("""
+                    el => {
+                      let parent = el.parentElement;
+                      for (let i = 0; parent && i < 3; i++, parent = parent.parentElement) {
+                        const text = parent.textContent || '';
+                        if (text.includes('全部') && text.includes('新招呼')) return true;
+                      }
+                      return false;
+                    }
+                    """));
+            if (!headerTab) continue;
+            if (unread != null) {
+                log.warn("自动回复：未读筛选入口不唯一，本轮跳过");
+                return false;
+            }
+            unread = candidate;
+        }
+        if (unread == null) {
+            log.warn("自动回复：未找到未读筛选，本轮跳过 | 页面：{}", page.url());
+            return false;
+        }
+        unread.click(new Locator.ClickOptions().setTimeout(5_000));
+        PlaywrightUtil.sleep(1);
+        boolean selected = Boolean.TRUE.equals(unread.evaluate("""
+                el => {
+                  for (let i = 0; el && i < 3; i++, el = el.parentElement) {
+                    if (el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-pressed') === 'true'
+                        || /(^|[\\s_-])(active|selected|cur|current|on)($|[\\s_-])/.test(el.className || '')) return true;
+                  }
+                  return false;
+                }
+                """));
+        if (!selected) log.warn("自动回复：未确认未读筛选已生效，本轮跳过");
+        return selected;
+    }
+
+    private boolean openReplySession(BossChatReader.Session expected) {
+        Locator items = page.locator(Locators.CHAT_LIST_ITEM);
+        Locator match = null;
+        for (int i = 0; i < items.count(); i++) {
+            Locator candidate = items.nth(i);
+            if (!BossChatReader.session(candidate).key().equals(expected.key())) continue;
+            if (match != null) {
+                log.warn("自动回复：会话身份不唯一，跳过 | 会话：{}", expected.title());
+                return false;
+            }
+            match = candidate;
+        }
+        if (match == null) {
+            log.warn("自动回复：会话已不在当前列表，稍后重试 | 会话：{}", expected.title());
+            return false;
+        }
+        // Pin the DOM node: an nth locator could resolve to another HR if rows reorder before click.
+        com.microsoft.playwright.ElementHandle node = match.elementHandle();
+        if (node == null) return false;
+        try {
+            if (!BossChatReader.session(node).key().equals(expected.key())) return false;
+            node.click(new com.microsoft.playwright.ElementHandle.ClickOptions().setTimeout(5_000));
+        } finally {
+            node.dispose();
+        }
+        PlaywrightUtil.sleep(2);
+        return true;
+    }
+
+    private JSONObject readStableChatMessage(BossChatReader.Session session) {
+        String previous = null;
+        for (int i = 0; i < 5; i++) {
+            JSONObject message = BossChatReader.message(page);
+            if (message.optBoolean("found") && BossChatReader.matchesSession(session, message)) {
+                String identity = message.getString("identity");
+                if (identity.equals(previous)) return message;
+                previous = identity;
+            } else {
+                previous = null;
+            }
+            PlaywrightUtil.sleep(1);
+        }
+        return null;
+    }
+
+    private boolean sendReplyToOpenSession(BossChatReader.Session session, ChatSnapshot expected, String reply) {
+        // Opening an unread row removes it from that list; verify the still-open pane instead.
+        JSONObject current = readStableChatMessage(session);
+        if (current == null || current.optBoolean("self")
+                || !expected.messageId().equals(current.optString("identity"))) {
+            log.info("自动回复：生成期间会话已有新消息或已手动回复，下轮重新判断 | 会话：{}", session.title());
+            return false;
+        }
+        Locator input = page.locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area").first();
+        if (input.count() == 0 || !input.isVisible()) {
+            log.warn("自动回复：输入框不可用，稍后重试 | 会话：{}", session.title());
+            return false;
+        }
+        String draft = String.valueOf(input.evaluate("el => el.tagName.toLowerCase() === 'textarea' ? el.value : el.innerText"));
+        if (!draft.isBlank()) {
+            log.info("自动回复：输入框有未发送草稿，跳过 | 会话：{}", session.title());
+            return false;
+        }
+        // Playwright fill supports both textarea and contenteditable and emits input events.
+        boolean confirmed = false;
+        try {
+            input.fill(reply, new Locator.FillOptions().setTimeout(5_000));
+            Locator send = page.locator("div.send-message, button[type='send'].btn-send, button.btn-send").first();
+            if (send.count() == 0 || !send.isVisible() || !send.isEnabled()) {
+                log.warn("自动回复：发送按钮不可用，未记录为已回复 | 会话：{}", session.title());
+                return false;
+            }
+            // Last check immediately before clicking; do not send a stale answer.
+            JSONObject latest = BossChatReader.message(page);
+            if (!BossChatReader.matchesSession(session, latest)
+                    || !expected.messageId().equals(latest.optString("identity")) || latest.optBoolean("self")) {
+                log.info("自动回复：发送前消息已变化，取消本次发送 | 会话：{}", session.title());
+                return false;
+            }
+            int before = current.optInt("ownCount");
+            send.click(new Locator.ClickOptions().setTimeout(5_000));
+            int stable = 0;
+            for (int i = 0; i < 12; i++) {
+                PlaywrightUtil.sleep(1);
+                JSONObject sent = BossChatReader.message(page);
+                String selected = sent.optString("selectedKey");
+                if (!selected.isEmpty() && !session.key().equals(selected)) break;
+                if (sent.optBoolean("self") && reply.equals(sent.optString("text"))
+                        && sent.optInt("ownCount") > before) {
+                    if (sent.optBoolean("failed")) break;
+                    stable = sent.optBoolean("sending") ? 0 : stable + 1;
+                    if (stable >= 2) {
+                        log.info("自动回复已确认发送 | 会话：{} | 内容：{}", session.title(), reply);
+                        confirmed = true;
+                        return true;
+                    }
+                } else {
+                    stable = 0;
+                }
+            }
+            log.warn("自动回复：未确认发送成功，未记录为已回复 | 会话：{}", session.title());
+            return false;
+        } finally {
+            if (!confirmed) {
+                // Remove only the draft inserted by this attempt; never overwrite a user's edit.
+                String remaining = String.valueOf(input.evaluate(
+                        "el => el.tagName.toLowerCase() === 'textarea' ? el.value : el.innerText"));
+                if (reply.equals(remaining)) input.fill("", new Locator.FillOptions().setTimeout(5_000));
+            }
+        }
     }
 
     private void postJobByCity(String cityCode) {
@@ -420,10 +732,46 @@ public class Boss {
                     log.info("被过滤：职位黑名单命中 | 公司：{} | 岗位：{} | 关键词：{}", bossCompany != null ? bossCompany : "", jobName, term != null ? term : "");
                     continue;
                 }
-                // HR活跃状态过滤：当开启过滤开关且活跃描述包含“年”时，视为不活跃
-                boolean hrInactiveByYear = bossActive != null && bossActive.contains("年");
-                if (Boolean.TRUE.equals(config.getFilterDeadHR()) && hrInactiveByYear) {
-                    log.info("被过滤：HR活跃状态包含‘年’ | 公司：{} | 岗位：{} | 活跃：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossActive);
+                // 职位相关性硬校验：白名单非空时，职位名必须命中技术方向关键词才投递。
+                // 这是一道不依赖 AI 的兜底，AI 不可用或误判时仍能拦住非计算机/非开发岗位。
+                if (jobWhiteWords != null && !jobWhiteWords.isEmpty()) {
+                    String nameLower = jobName == null ? "" : jobName.toLowerCase();
+                    boolean relevant = jobWhiteWords.stream()
+                            .anyMatch(w -> w != null && !w.isEmpty() && nameLower.contains(w.toLowerCase()));
+                    if (!relevant) {
+                        log.info("被拦截：岗位与开发方向无关 | 公司：{} | 岗位：{}", bossCompany != null ? bossCompany : "", jobName);
+                        try {
+                            if (progressCallback != null) {
+                                progressCallback.accept("跳过不相关岗位：" + jobName, i + 1, count);
+                            }
+                        } catch (Throwable ignore) {}
+                        continue;
+                    }
+                }
+                // 职位描述（JD）校验：命中排除词（如「3年以上」「社招」「硕士及以上」）则不投递。
+                // 这是 AI 之外的兜底：AI 未配置 API_KEY 时，仍能拦住要求工作经验的社会招聘岗位。
+                // JD 为空时不拦截，避免因抓取失败误杀。
+                if (jobJdBlackWords != null && !jobJdBlackWords.isEmpty() && jobDesc != null && !jobDesc.isEmpty()) {
+                    String jdLower = jobDesc.toLowerCase();
+                    String hit = jobJdBlackWords.stream()
+                            .filter(w -> w != null && !w.isEmpty() && jdLower.contains(w.toLowerCase()))
+                            .findFirst().orElse(null);
+                    if (hit != null) {
+                        log.info("被拦截：JD 命中排除词「{}」 | 公司：{} | 岗位：{}", hit, bossCompany != null ? bossCompany : "", jobName);
+                        try {
+                            if (progressCallback != null) {
+                                progressCallback.accept("跳过（JD 不符）：" + jobName, i + 1, count);
+                            }
+                        } catch (Throwable ignore) {}
+                        continue;
+                    }
+                }
+                // HR活跃状态过滤：开启开关后按 boss_config.hr_active_keep（白名单）判定，
+                // 白名单非空时只投递「刚刚 / 今日 / 3日内 / 本周」这类明确近期的 HR，
+                // 其余（含抓不到活跃度的）一律跳过但仍入库；白名单为空才回退 dead_status 黑名单。
+                boolean hrInactive = isHrInactive(bossActive, config.getDeadStatus(), config.getHrActiveKeep());
+                if (Boolean.TRUE.equals(config.getFilterDeadHR()) && hrInactive) {
+                    log.info("被过滤：HR活跃度不满足要求 | 公司：{} | 岗位：{} | 活跃：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossActive);
                     continue;
                 }
                 if (bossCompany != null && blackCompanies != null && blackCompanies.stream().anyMatch(bossCompany::contains)) {
@@ -549,10 +897,9 @@ public class Boss {
                 if (!filtered && blackRecruiters != null && blackRecruiters.stream().anyMatch(hrPosition::contains)) filtered = true;
             } catch (Throwable ignore) {}
 
-            // HR活跃状态过滤：开启过滤且活跃描述包含“年”，则标记为已过滤，但仍入库
+            // HR活跃状态过滤：开启过滤且命中"不活跃状态"列表，则标记为已过滤，但仍入库
             if (!filtered && Boolean.TRUE.equals(config.getFilterDeadHR())) {
-                String hrActive = entity.getHrActiveStatus();
-                if (hrActive != null && hrActive.contains("年")) {
+                if (isHrInactive(entity.getHrActiveStatus(), config.getDeadStatus(), config.getHrActiveKeep())) {
                     filtered = true;
                 }
             }
@@ -1108,19 +1455,30 @@ public class Boss {
         String aiMessage = null;
         if (!repeatChat && Boolean.TRUE.equals(config.getEnableAI())) {
             String jd = job.getJobInfo();
-            if (jd != null && !jd.isEmpty()) {
-                AiMessageDecision decision = generateAiMessage(keyword, job.getJobName(), jd);
+            // JD 缺失时不再完全跳过 AI：改用占位说明让模型只依据职位名称判断
+            String jdForAi = (jd != null && !jd.isBlank())
+                    ? jd
+                    : "（该岗位未返回职位描述，请仅依据职位名称判断）";
+            if (Boolean.TRUE.equals(config.getEnableAI())) {
+                AiMessageDecision decision = generateAiMessage(keyword, job.getJobName(), jdForAi);
                 if (decision.skipCurrentJob()) {
-                    log.info("AI返回false，跳过当前岗位投递 | 公司：{} | 岗位：{}",
-                            job.getCompanyName(), job.getJobName());
+                    log.info("AI判定不匹配，跳过当前岗位 | 公司：{} | 岗位：{} | 原因：{}",
+                            job.getCompanyName(), job.getJobName(),
+                            decision.reason() != null ? decision.reason() : "未说明");
                     if (progressCallback != null) {
-                        progressCallback.accept("AI判断不匹配，跳过当前岗位：" + job.getJobName(), 0, 0);
+                        progressCallback.accept("AI判断不匹配，跳过：" + job.getJobName()
+                                + (decision.reason() != null ? "（" + decision.reason() + "）" : ""), 0, 0);
                     }
                     try { detailPage.close(); } catch (Exception ignore) {}
                     return false;
                 }
                 aiMessage = decision.message();
             }
+        }
+        if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
+            log.info("停止指令已触发，取消发送招呼语 | 公司：{}", job.getCompanyName());
+            try { detailPage.close(); } catch (Exception ignore) {}
+            return false;
         }
         String message = repeatChat ? repeatMessage : (isValidString(aiMessage) ? aiMessage : config.getSayHi());
 
@@ -1693,6 +2051,35 @@ public class Boss {
         return maxSalary != null && jobSalary[0] > maxSalary;
     }
 
+    /**
+     * 判断 HR 活跃度是否"不达标"。
+     * <p>
+     * 判定优先级：
+     * <ol>
+     *   <li><b>白名单</b>（boss_config.hr_active_keep）非空时：只有活跃度命中其中一项才算达标，
+     *       其余（含抓取失败得到的空值）一律视为不达标。这是"只投 1 周内活跃"的正确实现方式 ——
+     *       黑名单穷举不全，Boss 随时可能冒出新的档位（如「2周内活跃」「上周活跃」）。</li>
+     *   <li><b>黑名单</b>（boss_config.dead_status）非空时：命中即不达标。</li>
+     *   <li>两者都为空：回退上游默认行为（含"年"视为不活跃）。</li>
+     * </ol>
+     */
+    private boolean isHrInactive(String activeTimeText, List<String> deadStatus, List<String> hrActiveKeep) {
+        // 白名单优先：非空时只看白名单
+        if (hrActiveKeep != null && !hrActiveKeep.isEmpty()) {
+            if (activeTimeText == null || activeTimeText.isBlank()) {
+                return true; // 抓不到活跃度 = 无法确认近期活跃，按不达标处理
+            }
+            return !containsDeadStatus(activeTimeText, hrActiveKeep);
+        }
+        if (activeTimeText == null || activeTimeText.isBlank()) {
+            return false;
+        }
+        if (deadStatus == null || deadStatus.isEmpty()) {
+            return activeTimeText.contains("年");
+        }
+        return containsDeadStatus(activeTimeText, deadStatus);
+    }
+
     public boolean containsDeadStatus(String activeTimeText, List<String> deadStatus) {
         for (String status : deadStatus) {
             if (activeTimeText.contains(status)) {
@@ -1703,7 +2090,7 @@ public class Boss {
     }
 
     /** AI 生成结果：skipCurrentJob=true 表示只跳过当前岗位，不影响同企业的其他岗位。 */
-    private record AiMessageDecision(boolean skipCurrentJob, String message) {}
+    private record AiMessageDecision(boolean skipCurrentJob, String message, String reason) {}
 
     private AiMessageDecision generateAiMessage(String keyword, String jobName, String jd) {
         AiEntity aiConfig = aiService.getAiConfig();
@@ -1717,16 +2104,41 @@ public class Boss {
         try {
             String result = aiService.sendRequest(requestMessage);
             if (result == null) {
-                return new AiMessageDecision(false, config.getSayHi());
+                return new AiMessageDecision(false, config.getSayHi(), null);
             }
+            // 先按原有规则识别纯 false，保持与旧版本一致的行为
             if (isAiRejectResponse(result)) {
-                return new AiMessageDecision(true, null);
+                return new AiMessageDecision(true, null, null);
             }
-            return new AiMessageDecision(false, result);
+            // 新增：支持 false|原因 形式，便于在日志中复核 AI 为什么拒绝
+            String reason = extractAiRejectReason(result);
+            if (reason != null) {
+                return new AiMessageDecision(true, null, reason);
+            }
+            return new AiMessageDecision(false, result, null);
         } catch (Exception e) {
             log.warn("AI请求失败，使用原有打招呼语: {}", e.getMessage());
-            return new AiMessageDecision(false, config.getSayHi());
+            return new AiMessageDecision(false, config.getSayHi(), null);
         }
+    }
+
+    /**
+     * 从 false|原因 形式的回复中提取原因；不是该形式则返回 null。
+     * 兼容中文竖线/冒号/破折号分隔，并容忍 markdown 包裹符号。
+     */
+    private String extractAiRejectReason(String result) {
+        if (result == null) {
+            return null;
+        }
+        String text = result.trim().replaceAll("^[*`'\"\\s]+", "");
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?i)^false\\s*[|｜:：\\-—]\\s*(.+)$")
+                .matcher(text);
+        if (matcher.find()) {
+            String reason = matcher.group(1).trim().replaceAll("[*`'\"。.!！\\s]+$", "");
+            return reason.isEmpty() ? null : reason;
+        }
+        return null;
     }
 
     /**

@@ -5,6 +5,8 @@ import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.WaitUntilState;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -27,6 +29,18 @@ public class PlaywrightController {
         this.playwrightManager = playwrightManager;
     }
 
+    @PostMapping("/platforms/{platform}/open")
+    public ResponseEntity<Map<String, Object>> openPlatform(@PathVariable String platform) {
+        try {
+            playwrightManager.ensurePlatformReady(platform);
+            return ResponseEntity.ok(Map.of("success", true, "isLoggedIn", playwrightManager.isLoggedIn(platform)));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body(Map.of("success", false, "message", "平台初始化失败，请稍后重试"));
+        }
+    }
+
     /**
      * 获取Playwright状态信息
      */
@@ -36,11 +50,46 @@ public class PlaywrightController {
         status.put("initialized", playwrightManager.isInitialized());
         status.put("cdpPort", playwrightManager.getCdpPort());
         status.put("hasBossPage", playwrightManager.getBossPage() != null);
+        status.put("hasLiepinPage", playwrightManager.getLiepinPage() != null);
+        status.put("hasJob51Page", playwrightManager.getJob51Page() != null);
+        status.put("hasZhilianPage", playwrightManager.getZhilianPage() != null);
         // 改用持久化上下文后没有独立的 Browser 对象，context 即代表浏览器本身
         status.put("hasBrowser", playwrightManager.getContext() != null);
         status.put("bossLoggedIn", playwrightManager.isLoggedIn("boss"));
 
         return ResponseEntity.ok(status);
+    }
+
+    /** 只读结构诊断：不点击会话，不返回聊天内容、Cookie 或联系人资料。 */
+    @GetMapping("/chat-structure")
+    public ResponseEntity<?> chatStructure() {
+        if (playwrightManager.getBossPage() == null) {
+            return ResponseEntity.ok(Map.of("success", false, "message", "Boss 页面尚未初始化"));
+        }
+        Object structure = playwrightManager.callOnPlaywright(() -> playwrightManager.getBossPage().evaluate("""
+                () => {
+                  const visible = e => !!(e.getClientRects().length);
+                  const meta = e => ({tag: e.tagName, role: e.getAttribute('role'), cls: e.className,
+                    children: e.children.length, visible: visible(e)});
+                  const ancestors = e => {
+                    const result = [];
+                    for (let i = 0; e && i < 5; i++, e = e.parentElement) result.push(meta(e));
+                    return result;
+                  };
+                  const count = s => document.querySelectorAll(s).length;
+                  return {
+                    url: location.href, readyState: document.readyState,
+                    listItems: count('[role="listitem"]'), liItems: count('li[role="listitem"]'),
+                    titles: count('.title-box'), names: count('.name-box'), previews: count('.last-msg-text'),
+                    messageItems: count('li.message-item'),
+                    roles: [...document.querySelectorAll('[role="listitem"]')].slice(0, 4).map(ancestors),
+                    titleAncestors: [...document.querySelectorAll('.title-box, .last-msg-text')].slice(0, 4).map(ancestors),
+                    containers: [...document.querySelectorAll('ul, [role="list"], [class*="chat-list"], [class*="geek-item"], [class*="conversation"]')]
+                      .slice(0, 25).map(meta)
+                  };
+                }
+                """));
+        return ResponseEntity.ok(structure);
     }
 
     /**

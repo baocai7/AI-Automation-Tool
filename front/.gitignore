@@ -41,3 +41,5 @@ next-env.d.ts
 
 # turbopack
 .turbopack
+# 项目内的 pnpm 下载缓存
+/.pnpm-store/

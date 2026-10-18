@@ -7,6 +7,7 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
 import org.springframework.beans.factory.annotation.Autowired;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.application.service.RewardClaimService;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
@@ -30,8 +31,14 @@ public class StartupRunner implements ApplicationRunner {
     @Autowired
     private PlaywrightManager playwrightManager;
 
+    @Autowired
+    private RewardClaimService rewardClaimService;
+
     @Override
     public void run(ApplicationArguments args) throws Exception {
+        // 启动入口优先触发积分领取；客户端操作独立异步执行，不阻塞后续服务初始化。
+        rewardClaimService.claimOnStartup();
+
         String urlToOpen = determineUrlToOpen();
         if (urlToOpen != null) {
             openBrowser(urlToOpen);
@@ -46,6 +53,7 @@ public class StartupRunner implements ApplicationRunner {
             log.error("Playwright 初始化失败: {}", e.getMessage());
             throw e;
         }
+
     }
 
     /**

@@ -10,6 +10,8 @@ config.yaml
 *.ipr
 .idea
 *.sh
+!/start-getjobs.sh
+!/restart-getjobs-verified.sh
 CLAUDE.md
 .claude
 nul
@@ -48,6 +50,13 @@ cookie.json
 # 各平台登录 Cookie（cookies/<platform>.json，含登录态，绝对不能提交）
 cookies/
 .env
+.env.*
+!.env.example
+/.tools/
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 chromedriver
 *.jpg
 !docs/public/images/aliPay.jpg
@@ -60,6 +69,9 @@ chromedriver
 # Database files
 db/
 *.db
+!src/main/resources/db/
+!src/main/resources/db/migration/
+!src/main/resources/db/migration/*.sql
 
 # Frontend build output
 dist/

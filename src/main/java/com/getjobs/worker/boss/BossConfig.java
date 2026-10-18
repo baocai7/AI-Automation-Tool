@@ -119,7 +119,13 @@ public class BossConfig {
     private String waitTime;
 
     /**
-     * HR未上线状态
+     * HR未上线状态（黑名单：命中即跳过）
      */
     private List<String> deadStatus;
+
+    /**
+     * HR 活跃度白名单：非空时优先级最高，只有命中其中一项才算"达标"，
+     * 未命中（含抓不到的空值）一律视为不达标。为空则回退到 deadStatus 黑名单。
+     */
+    private List<String> hrActiveKeep;
 }

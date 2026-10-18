@@ -15,7 +15,6 @@ export default function Sidebar() {
 
   // 健康检查状态：up / degraded / down / unknown
   const [health, setHealth] = useState<'up' | 'degraded' | 'down' | 'unknown'>('unknown')
-  const [checking, setChecking] = useState(false)
 
   useEffect(() => {
     setMounted(true)
@@ -23,13 +22,17 @@ export default function Sidebar() {
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null
+    let inFlight = false
+    let stopped = false
+    let activeController: AbortController | null = null
 
     const check = async () => {
-      if (checking) return
-      setChecking(true)
+      if (inFlight || stopped || document.hidden) return
+      inFlight = true
       const baseUrl = process.env.API_BASE_URL || `${API_BASE}`
 
       const controller = new AbortController()
+      activeController = controller
       const timeout = setTimeout(() => controller.abort(), 3000)
       try {
         // 先尝试自定义健康接口
@@ -40,6 +43,7 @@ export default function Sidebar() {
         }
         if (!res.ok) throw new Error(`status ${res.status}`)
         const data = await res.json()
+        if (stopped) return
         const statusRaw = (data.status || data.state || '').toString().toUpperCase()
         if (statusRaw === 'UP' || statusRaw === 'HEALTHY') {
           setHealth('up')
@@ -49,18 +53,23 @@ export default function Sidebar() {
           setHealth('down')
         }
       } catch (e) {
-        setHealth('unknown')
+        if (!stopped) setHealth('unknown')
       } finally {
         clearTimeout(timeout)
-        setChecking(false)
+        inFlight = false
+        activeController = null
       }
     }
 
     // 首次检查 + 轮询
     check()
     interval = setInterval(check, 30000)
+    document.addEventListener('visibilitychange', check)
     return () => {
+      stopped = true
       if (interval) clearInterval(interval)
+      activeController?.abort()
+      document.removeEventListener('visibilitychange', check)
     }
   }, [])
 

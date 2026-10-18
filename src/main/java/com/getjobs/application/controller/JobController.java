@@ -12,6 +12,9 @@ import com.getjobs.worker.service.Job51JobService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.util.function.Consumer;
 import org.apache.catalina.connector.ClientAbortException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -50,6 +53,17 @@ public class JobController {
     // SSE emitter lists
     private final List<SseEmitter> job51ProgressEmitters = new CopyOnWriteArrayList<>();
     private final List<SseEmitter> loginStatusEmitters = new CopyOnWriteArrayList<>();
+    private final Consumer<PlaywrightManager.LoginStatusChange> loginStatusListener = this::sendLoginStatusChange;
+
+    @PostConstruct
+    public void registerLoginStatusListener() {
+        playwrightManager.addLoginStatusListener(loginStatusListener);
+    }
+
+    @PreDestroy
+    public void unregisterLoginStatusListener() {
+        playwrightManager.removeLoginStatusListener(loginStatusListener);
+    }
 
     // ==================== 51job 投递进度 SSE ====================
 
@@ -90,8 +104,6 @@ public class JobController {
     public SseEmitter streamLoginStatus() {
         SseEmitter emitter = new SseEmitter(0L);
         loginStatusEmitters.add(emitter);
-
-        playwrightManager.addLoginStatusListener(this::sendLoginStatusChange);
 
         emitter.onCompletion(() -> {
             log.info("登录状态SSE连接已完成");

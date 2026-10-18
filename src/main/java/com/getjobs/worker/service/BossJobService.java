@@ -6,6 +6,8 @@ import com.getjobs.worker.boss.BossConfig;
 import com.getjobs.worker.dto.JobProgressMessage;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.microsoft.playwright.Page;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,11 +35,13 @@ public class BossJobService implements JobPlatformService {
     private volatile boolean isRunning = false;
     // 停止标志
     private volatile boolean shouldStop = false;
+    private volatile boolean shuttingDown;
     // 本次任务的开始时间（毫秒），用于判断任务是不是卡死了
     private volatile long runningSince = 0L;
 
     @Override
     public void executeDelivery(Consumer<JobProgressMessage> progressCallback) {
+        if (shuttingDown) return;
         if (isRunning) {
             progressCallback.accept(JobProgressMessage.warning(PLATFORM, "任务已在运行中"));
             return;
@@ -47,7 +51,7 @@ public class BossJobService implements JobPlatformService {
             // 浏览器可能已经被关掉（手动关窗口 / Chrome 崩溃），这时各字段仍非空，
             // 但每个操作都会抛 TargetClosedError。先确保浏览器可用，必要时重新拉起。
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
-            playwrightManager.ensureReady();
+            playwrightManager.ensurePlatformReady("boss");
 
             // 获取Boss页面实例
             Page page = playwrightManager.getBossPage();
@@ -63,6 +67,7 @@ public class BossJobService implements JobPlatformService {
             }
 
             // 通过校验后再标记运行
+            if (shuttingDown) return;
             isRunning = true;
             shouldStop = false;
             runningSince = System.currentTimeMillis();
@@ -111,6 +116,12 @@ public class BossJobService implements JobPlatformService {
                 playwrightManager.resumeBossMonitoring();
             } catch (Exception ignored) {}
         }
+    }
+
+    @EventListener(ContextClosedEvent.class)
+    public void stopOnShutdown() {
+        shuttingDown = true;
+        stopDelivery();
     }
 
     @Override

@@ -2,6 +2,7 @@ package com.getjobs.application.service;
 
 import com.getjobs.application.entity.AiEntity;
 import com.getjobs.application.mapper.AiMapper;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
@@ -29,6 +30,15 @@ import java.time.format.DateTimeFormatter;
 public class AiService {
     private final ConfigService configService;
     private final AiMapper aiMapper;
+    // 复用连接池和 Selector 线程，避免每条回复新建一个 HttpClient。
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(60))
+            .build();
+
+    @PreDestroy
+    public void closeHttpClient() {
+        httpClient.shutdownNow();
+    }
 
     /**
      * 发送 AI 请求（非流式）并返回回复内容。
@@ -47,10 +57,6 @@ public class AiService {
                 : buildChatCompletionsEndpoint(baseUrl);
 
         int timeoutInSeconds = 60;
-
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(timeoutInSeconds))
-                .build();
 
         // 构建 JSON 请求体
         JSONObject requestData = new JSONObject();
@@ -71,10 +77,17 @@ public class AiService {
             message.put("content", content);
             messages.put(message);
             requestData.put("messages", messages);
+            // 可选：关闭思考模式。仅当配置 AI_THINKING=disabled 时才发送该字段，
+            // 避免对不支持该参数的模型/中转造成报错；未配置时行为与改动前完全一致。
+            String thinkingMode = configService.getConfigValue("AI_THINKING");
+            if (thinkingMode != null && "disabled".equalsIgnoreCase(thinkingMode.trim())) {
+                requestData.put("thinking", new JSONObject().put("type", "disabled"));
+            }
         }
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(timeoutInSeconds))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("Authorization", "Bearer " + apiKey)
@@ -84,7 +97,7 @@ public class AiService {
                 .build();
 
         try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() == 200) {
                 JSONObject responseObject = new JSONObject(response.body());
 
@@ -201,9 +214,6 @@ public class AiService {
      */
     private String sendRequestViaResponses(String content, String apiKey, String model, String endpoint) {
         int timeoutInSeconds = 60;
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(timeoutInSeconds))
-                .build();
 
         JSONObject requestData = new JSONObject();
         requestData.put("model", model);
@@ -212,6 +222,7 @@ public class AiService {
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(timeoutInSeconds))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("Authorization", "Bearer " + apiKey)
@@ -220,7 +231,7 @@ public class AiService {
                 .build();
 
         try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() == 200) {
                 JSONObject resp = new JSONObject(response.body());
                 String outputText = resp.optString("output_text", null);

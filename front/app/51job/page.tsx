@@ -11,7 +11,7 @@ import { Select } from '@/components/ui/select'
 import PageHeader from '@/app/components/PageHeader'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnalysisContent from '@/app/51job/analysis/AnalysisContent'
-import { API_BASE } from '@/lib/api'
+import { API_BASE, openPlatform } from '@/lib/api'
 
 interface Job51Config {
   id?: number
@@ -47,6 +47,14 @@ export default function Job51Page() {
   const [selectedSalaries, setSelectedSalaries] = useState<string[]>([])
   // 薪资下拉面板开关状态
   const [salaryDropdownOpen, setSalaryDropdownOpen] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    openPlatform('51job').then(loggedIn => {
+      if (active) setIsLoggedIn(loggedIn)
+    }).catch(error => console.error('打开平台失败:', error))
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     if (!backendAvailable) {

@@ -11,7 +11,7 @@ import { Select } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnalysisContent from '@/app/liepin/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
-import { API_BASE } from '@/lib/api'
+import { API_BASE, openPlatform } from '@/lib/api'
 
 interface LiepinConfig {
   id?: number
@@ -50,6 +50,14 @@ export default function LiepinPage() {
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showLogoutResultDialog, setShowLogoutResultDialog] = useState(false)
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
+
+  useEffect(() => {
+    let active = true
+    openPlatform('liepin').then(loggedIn => {
+      if (active) setIsLoggedIn(loggedIn)
+    }).catch(error => console.error('打开平台失败:', error))
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     fetchAllData()

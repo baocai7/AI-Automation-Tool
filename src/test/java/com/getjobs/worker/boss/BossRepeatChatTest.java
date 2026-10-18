@@ -1,6 +1,7 @@
 package com.getjobs.worker.boss;
 
 import com.getjobs.application.service.BossService;
+import com.getjobs.application.service.AiService;
 import com.getjobs.worker.utils.Job;
 import com.getjobs.worker.utils.PlaywrightUtil;
 import com.microsoft.playwright.*;
@@ -17,7 +18,8 @@ class BossRepeatChatTest {
     @CsvSource({"立即沟通,false,true,false", "立即沟通,true,true,false", "继续沟通,false,false,false", "继续沟通,true,true,false", "立即沟通,,true,false", "继续沟通,,false,false", "已关闭,true,false,false", "继续沟通,true,false,true"})
     void sendsOnlyWhenButtonAndSwitchAllow(String text, Boolean enabled, boolean expected, boolean emptyMessages) throws Exception {
         BossService service = mock(BossService.class);
-        Boss boss = new Boss(service, null, null);
+        AiService ai = mock(AiService.class);
+        Boss boss = new Boss(service, ai, null);
         BossConfig config = new BossConfig();
         config.setAllowRepeatChat(enabled);
         config.setSayHi("您好，希望进一步沟通。");
@@ -60,6 +62,7 @@ class BossRepeatChatTest {
         verify(button, times(expected ? 1 : 0)).click();
         verify(input, times(expected ? 1 : 0)).fill("继续沟通".equals(text) ? "自定义跟进消息" : config.getSayHi());
         verify(send, times(expected ? 1 : 0)).click();
+        verify(ai, times(expected && "立即沟通".equals(text) ? 1 : 0)).sendRequest(anyString());
         verify(detail).close();
     }
 

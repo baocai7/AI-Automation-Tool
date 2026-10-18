@@ -13,6 +13,7 @@ import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -57,6 +58,48 @@ public class PlaywrightManager {
     // 但任何页面操作都会抛 TargetClosedError，投递任务随即卡死、按钮再点毫无反应。
     private volatile boolean browserClosed = false;
 
+    // 沙箱开关（本地新增，默认行为与上游一致：开启沙箱）。
+    // 上游硬性 setChromiumSandbox(true)，因为 --no-sandbox 本身就是自动化特征。
+    // 但在受管/受限终端里 Chrome 沙箱起不来（sandbox initialization failed:
+    // Operation not permitted），会直接把启动流程拖垮。设置环境变量
+    // GETJOBS_NO_SANDBOX=true 即可关掉沙箱；正常桌面环境不需要设。
+    private static final boolean CHROMIUM_SANDBOX =
+            !"true".equalsIgnoreCase(System.getenv("GETJOBS_NO_SANDBOX"));
+
+    /**
+     * Chrome 启动参数。默认与上游一致；仅在关掉沙箱（GETJOBS_NO_SANDBOX=true）时追加
+     * --disable-gpu —— 实测在受限环境里 GPU 进程会反复崩溃（exit_code=6）并升级成
+     * "GPU process isn't usable. Goodbye." 直接杀掉浏览器，表现为页面对象变成
+     * TargetClosedError。正常桌面环境不受影响。
+     */
+    private static List<String> buildChromeArgs() {
+        List<String> args = new ArrayList<>(List.of(
+                "--start-maximized",
+                // Patchright 会加 --disable-blink-features=AutomationControlled，
+                // Chrome 因此弹"不受支持的命令行标记"黄条，用 --test-type 抑制
+                "--test-type",
+                // 上次非正常退出（IDEA 停止按钮、崩溃、kill）后，Chrome 会弹
+                // "要恢复页面吗？"模态框。那个框会挂起所有 CDP 页面操作，
+                // 表现为 navigate 永远不返回、连超时都不触发，整个初始化焊死。
+                "--disable-session-crashed-bubble",
+                "--hide-crash-restore-bubble",
+                "--no-first-run",
+                "--no-default-browser-check",
+                // 强制直连，不走系统代理（代理出口 IP 更容易被风控标记）
+                "--no-proxy-server",
+                "--proxy-bypass-list=*",
+                // 把 navigator.webdriver 压成 false。
+                // patchright 的 driver 会自动加这个标志，但它的超时机制是坏的
+                // （navigate/isVisible/waitForLoadState 的 timeout 全部失效，
+                // 会把线程无限期挂死）；用官方 driver 就得自己加。
+                "--disable-blink-features=AutomationControlled"
+        ));
+        if (!CHROMIUM_SANDBOX) {
+            args.add("--disable-gpu");
+        }
+        return args;
+    }
+
     // 浏览器上下文（所有平台共享，在同一个窗口中打开多个标签页）
     private BrowserContext context;
 
@@ -74,6 +117,10 @@ public class PlaywrightManager {
 
     // 登录状态追踪（平台 -> 是否已登录）
     private final Map<String, Boolean> loginStatus = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastLoginProbe = new ConcurrentHashMap<>();
+
+    @Value("${automation.login-check.logged-in-interval-ms:30000}")
+    private long loggedInCheckIntervalMs = 30_000;
 
     // 登录状态监听器
     private final List<Consumer<LoginStatusChange>> loginStatusListeners = new CopyOnWriteArrayList<>();
@@ -208,10 +255,9 @@ public class PlaywrightManager {
      * @return 是否真的提交了任务
      */
     public boolean tryRunOnPlaywright(Runnable task) {
-        if (playwrightQueueDepth.get() > 0) {
+        if (!playwrightQueueDepth.compareAndSet(0, 1)) {
             return false;
         }
-        playwrightQueueDepth.incrementAndGet();
         playwrightExecutor.execute(() -> {
             try {
                 task.run();
@@ -308,28 +354,8 @@ public class PlaywrightManager {
                             .setHeadless(false)     // 无头必被检测
                             .setSlowMo(50)          // 放慢操作速度，便于调试
                             .setViewportSize(null)  // 不锁视口，用窗口实际大小
-                            .setChromiumSandbox(true) // 不加 --no-sandbox：它本身就是自动化特征
-                            .setArgs(List.of(
-                                    "--start-maximized",
-                                    // Patchright 会加 --disable-blink-features=AutomationControlled，
-                                    // Chrome 因此弹"不受支持的命令行标记"黄条，用 --test-type 抑制
-                                    "--test-type",
-                                    // 上次非正常退出（IDEA 停止按钮、崩溃、kill）后，Chrome 会弹
-                                    // "要恢复页面吗？"模态框。那个框会挂起所有 CDP 页面操作，
-                                    // 表现为 navigate 永远不返回、连超时都不触发，整个初始化焊死。
-                                    "--disable-session-crashed-bubble",
-                                    "--hide-crash-restore-bubble",
-                                    "--no-first-run",
-                                    "--no-default-browser-check",
-                                    // 强制直连，不走系统代理（代理出口 IP 更容易被风控标记）
-                                    "--no-proxy-server",
-                                    "--proxy-bypass-list=*",
-                                    // 把 navigator.webdriver 压成 false。
-                                    // patchright 的 driver 会自动加这个标志，但它的超时机制是坏的
-                                    // （navigate/isVisible/waitForLoadState 的 timeout 全部失效，
-                                    // 会把线程无限期挂死）；用官方 driver 就得自己加。
-                                    "--disable-blink-features=AutomationControlled"
-                            )));
+                            .setChromiumSandbox(CHROMIUM_SANDBOX) // 默认开启；GETJOBS_NO_SANDBOX=true 时关闭
+                            .setArgs(buildChromeArgs()));
             // 刻意不设置 UserAgent：伪造 UA 只改字符串，改不了 navigator.platform 和
             // navigator.userAgentData，反而制造出"UA 说 Mac、platform 说 Win32"这种致命矛盾。
             browserClosed = false;
@@ -342,8 +368,8 @@ public class PlaywrightManager {
             log.info("✓ Chrome已启动（持久化上下文: {}）", USER_DATA_DIR);
             log.info("✓ BrowserContext已创建（所有平台共享）");
 
-            // 顺序创建所有Page（避免并发创建Page导致的竞态条件）
-            log.info("开始创建所有平台的Page...");
+            // Boss 常驻用于自动回复；其他平台在打开对应管理页或执行任务时初始化。
+            log.info("创建 Boss 常驻页面，其他平台按需加载");
 
             // 持久化上下文自带的那个启动标签页不能复用！
             // 复用它会出现：标签页永远停在加载中（左上角一直转圈），而 page.evaluate /
@@ -356,19 +382,7 @@ public class PlaywrightManager {
             bossPage.setDefaultTimeout(DEFAULT_TIMEOUT);
             log.info("✓ Boss Page已创建");
 
-            liepinPage = context.newPage();
-            liepinPage.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 猎聘 Page已创建");
-
-            job51Page = context.newPage();
-            job51Page.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 51job Page已创建");
-
-            zhilianPage = context.newPage();
-            zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 智联招聘 Page已创建");
-
-            // 四个业务页都建好了，把持久化上下文自带的启动空白页关掉
+            // Boss 页建好后，关闭持久化上下文自带的启动页。
             for (Page startup : startupPages) {
                 try {
                     startup.close();
@@ -382,13 +396,9 @@ public class PlaywrightManager {
 
             // 各平台初始化必须串行：它们共享同一个 BrowserContext 和同一条 Playwright 连接，
             // 原来用 4 个 ForkJoinPool 线程并发跑，会互相打断导航（net::ERR_ABORTED）
-            log.info("开始依次初始化所有平台...");
             setupBossPlatform();
-            setupLiepinPlatform();
-            setup51jobPlatform();
-            setupZhilianPlatform();
 
-            log.info("✓ 浏览器自动化引擎初始化完成（所有平台已依次启动）");
+            log.info("✓ 浏览器自动化引擎初始化完成（Boss 常驻，其他平台按需启动）");
             log.info("========================================");
         } catch (Exception e) {
             log.error("✗ 浏览器自动化引擎初始化失败", e);
@@ -906,24 +916,22 @@ public class PlaywrightManager {
                     if (loginEntry != null && isVisibleQuick(loginEntry)) {
                         loginEntry.click(new Locator.ClickOptions().setTimeout(30000));
                         log.info("已点击 51job 首页的 ‘登录/注册’ 入口，等待用户登录...");
-                        asyncWaitFor51jobLogin();
+                        // 登录状态由统一调度器检测。
                     } else {
                         // 备用选择器：文本匹配
                         Locator altLoginEntry = job51Page.locator("text=/登录\\/注册|登录|注册/").first();
                         if (altLoginEntry != null && isVisibleQuick(altLoginEntry)) {
                             altLoginEntry.click(new Locator.ClickOptions().setTimeout(30000));
                             log.info("已点击 51job 首页的登录入口（文本匹配），等待用户登录...");
-                            asyncWaitFor51jobLogin();
+                            // 登录状态由统一调度器检测。
                         } else {
                             log.info("未找到 51job 登录入口元素，保持在首页等待用户自行登录");
-                            // 启动后台轮询，确保无导航也能检测到登录成功
-                            asyncWaitFor51jobLogin();
+                            // 登录状态由统一调度器检测。
                         }
                     }
                 } catch (Exception clickEx) {
                     log.warn("尝试点击 51job 登录入口时发生异常: {}，保持在首页等待用户登录", clickEx.getMessage());
-                    // 启动后台轮询，避免异常导致无法检测登录成功
-                    asyncWaitFor51jobLogin();
+                    // 登录状态由统一调度器检测。
                 }
             } else {
                 log.info("51job已登录");
@@ -1020,57 +1028,6 @@ public class PlaywrightManager {
     }
 
     /**
-     * 在后台异步等待 51job 登录成功。
-     * 说明：不阻塞初始化主流程，独立线程每秒轮询一次登录状态，最长等待5分钟。
-     */
-    private void asyncWaitFor51jobLogin() {
-        Thread waitThread = new Thread(() -> {
-            try {
-                int maxSeconds = 300; // 最长等待 5 分钟
-                final java.util.concurrent.atomic.AtomicBoolean loggedIn = new java.util.concurrent.atomic.AtomicBoolean(false);
-                for (int i = 0; i < maxSeconds; i++) {
-                    // 这个线程不能直接调 Playwright：它和 playwright-thread 同时读同一条连接，
-                    // 会抢走对方的事件，导致投递时报 "Object doesn't exist: response@..."。
-                    // 所以检测动作交给专用线程；专用线程正忙（比如在投递）就跳过这一秒。
-                    // tryRunOnPlaywright 是异步提交的，结果在下一轮循环开头再看
-                    if (loggedIn.get()) {
-                        return;
-                    }
-                    final int elapsed = i;
-                    tryRunOnPlaywright(() -> {
-                        if (job51MonitoringPaused) {
-                            return;
-                        }
-                        try {
-                            if (checkIf51jobLoggedIn()) {
-                                // 交由统一回调处理登录成功逻辑（包含状态更新与保存 Cookie）
-                                on51jobLoginSuccess();
-                                log.info("后台等待检测到 51job 登录成功，用时约 {} 秒", elapsed);
-                                loggedIn.set(true);
-                            }
-                        } catch (Exception ignored) {
-                        }
-                    });
-
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        log.debug("等待 51job 登录线程被中断");
-                        return;
-                    }
-                }
-                log.warn("后台等待 51job 登录超时（约5分钟），仍未检测到登录成功");
-            } catch (Exception e) {
-                log.warn("后台等待 51job 登录过程中发生异常: {}", e.getMessage());
-            }
-        }, "wait-51job-login-thread");
-
-        waitThread.setDaemon(true);
-        waitThread.start();
-    }
-
-    /**
      * 保存51job Cookie到数据库
      *
      * @param remark 备注信息
@@ -1145,6 +1102,11 @@ public class PlaywrightManager {
      * 触发 51job 登录流程：打开登录页并点击“微信扫码登录”按钮
      */
     public void trigger51jobLogin() {
+        if (!onPlaywrightThread()) {
+            runOnPlaywright(this::trigger51jobLogin);
+            return;
+        }
+        ensurePlatformReady("51job");
         try {
             if (job51Page == null) {
                 if (context == null) {
@@ -1444,6 +1406,11 @@ public class PlaywrightManager {
      * 主动触发智联招聘登录：点击二维码入口并等待登录成功跳转
      */
     public void triggerZhilianLogin() {
+        if (!onPlaywrightThread()) {
+            runOnPlaywright(this::triggerZhilianLogin);
+            return;
+        }
+        ensurePlatformReady("zhilian");
         try {
             if (zhilianPage == null) {
                 throw new IllegalStateException("智联招聘页面未初始化");
@@ -1764,23 +1731,76 @@ public class PlaywrightManager {
         // 否则会打断投递流程里正在进行的导航
         tryRunOnPlaywright(() -> {
             try {
-                if (liepinPage != null && !liepinMonitoringPaused) {
+                if (liepinPage != null && !liepinPage.isClosed() && !liepinMonitoringPaused && loginProbeDue("liepin")) {
                     checkLiepinLoginStatus(liepinPage);
                 }
                 // 其他平台如需也可启用（保留，但不强制）
-                if (bossPage != null && !bossMonitoringPaused) {
+                if (bossPage != null && !bossPage.isClosed() && !bossMonitoringPaused && loginProbeDue("boss")) {
                     checkLoginStatus(bossPage, "boss");
                 }
-                if (job51Page != null && !job51MonitoringPaused) {
+                if (job51Page != null && !job51Page.isClosed() && !job51MonitoringPaused && loginProbeDue("51job")) {
                     check51jobLoginStatus(job51Page);
                 }
-                if (zhilianPage != null && !zhilianMonitoringPaused) {
+                if (zhilianPage != null && !zhilianPage.isClosed() && !zhilianMonitoringPaused && loginProbeDue("zhilian")) {
                     checkZhilianLoginStatus(zhilianPage);
                 }
             } catch (Exception e) {
                 log.debug("定时登录检测异常: {}", e.getMessage());
             }
         });
+    }
+
+    // 扫码期间保持每 3 秒检测；已登录后每 30 秒检测一次，减少跨进程 DOM 查询。
+    boolean loginProbeDue(String platform) {
+        long now = System.nanoTime();
+        Long previous = lastLoginProbe.get(platform);
+        long intervalMs = isLoggedIn(platform) ? Math.max(3_000, loggedInCheckIntervalMs) : 3_000;
+        if (previous != null && now - previous < intervalMs * 1_000_000L) return false;
+        lastLoginProbe.put(platform, now);
+        return true;
+    }
+
+    /** 平台首次使用时初始化；所有页面创建和重建都在同一个 Playwright 线程串行完成。 */
+    public void ensurePlatformReady(String platform) {
+        if (!Set.of("boss", "liepin", "51job", "zhilian").contains(platform)) {
+            throw new IllegalArgumentException("不支持的平台：" + platform);
+        }
+        runOnPlaywright(() -> {
+            ensureReady();
+            switch (platform) {
+                case "boss" -> {
+                    if (bossPage.isClosed()) {
+                        bossPage = newPlatformPage();
+                        setupBossPlatform();
+                    }
+                }
+                case "liepin" -> {
+                    if (liepinPage == null || liepinPage.isClosed()) {
+                        liepinPage = newPlatformPage();
+                        setupLiepinPlatform();
+                    }
+                }
+                case "51job" -> {
+                    if (job51Page == null || job51Page.isClosed()) {
+                        job51Page = newPlatformPage();
+                        setup51jobPlatform();
+                    }
+                }
+                case "zhilian" -> {
+                    if (zhilianPage == null || zhilianPage.isClosed()) {
+                        zhilianLoginGuided = false;
+                        zhilianPage = newPlatformPage();
+                        setupZhilianPlatform();
+                    }
+                }
+            }
+        });
+    }
+
+    private Page newPlatformPage() {
+        Page page = context.newPage();
+        page.setDefaultTimeout(DEFAULT_TIMEOUT);
+        return page;
     }
 
     /**
@@ -1805,6 +1825,14 @@ public class PlaywrightManager {
      */
     @PreDestroy
     public void destroy() {
+        if (!onPlaywrightThread()) {
+            try {
+                runOnPlaywright(this::destroy);
+            } finally {
+                playwrightExecutor.shutdown();
+            }
+            return;
+        }
         log.info("开始关闭Playwright管理器...");
 
         try {
@@ -1857,7 +1885,11 @@ public class PlaywrightManager {
      * 但每个页面操作都会抛 TargetClosedError —— 投递任务卡死、按钮点了没反应。
      * 发起任务前先过一遍这里。
      */
-    public synchronized void ensureReady() {
+    public void ensureReady() {
+        if (!onPlaywrightThread()) {
+            runOnPlaywright(this::ensureReady);
+            return;
+        }
         if (isInitialized()) {
             return;
         }
@@ -1878,6 +1910,7 @@ public class PlaywrightManager {
         zhilianPage = null;
         browserClosed = false;
         loginStatus.clear();
+        lastLoginProbe.clear();
         init();
     }
 

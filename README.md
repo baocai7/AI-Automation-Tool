@@ -76,6 +76,17 @@
 
 ## 🚀 如何使用？
 
+### 本地增强版
+
+此版本增加了 Boss 未读自动回复、发送确认与逐条记录、客户端每日领取记录，以及按需打开平台的低负载运行方式。
+
+准备好下文说明的空数据库、Java 21、Node.js 22 和 Chrome 后，在仓库根目录运行 `bash start-getjobs.sh`。
+首次启动会准备构建产物；日常直接运行 JAR，默认后端端口 9527、管理页端口 6866。
+需要先运行后端测试再重启时，使用 `bash restart-getjobs-verified.sh`。
+
+详细说明：[自动回复](docs/auto-reply.md)、[低负载运行](docs/low-power.md)、[每日领取](docs/reward-claim.md)、[界面重设计方案](docs/design/前端界面重设计方案.md)。
+数据库、平台登录态、个人图片简历、日志和构建产物不随源码上传。
+
 ### 1️⃣ 使用git拉取代码
 
 ```

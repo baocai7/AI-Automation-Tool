@@ -20,3 +20,11 @@ export const API_BASE =
 export function apiUrl(path: string): string {
   return `${API_BASE}${path}`
 }
+
+/** 打开用户正在使用的平台，未访问的平台不创建浏览器标签页。 */
+export async function openPlatform(platform: 'liepin' | '51job' | 'zhilian'): Promise<boolean> {
+  const response = await fetch(apiUrl(`/api/playwright/platforms/${platform}/open`), { method: 'POST' })
+  const result = await response.json()
+  if (!response.ok || !result.success) throw new Error(result.message || '平台初始化失败')
+  return Boolean(result.isLoggedIn)
+}

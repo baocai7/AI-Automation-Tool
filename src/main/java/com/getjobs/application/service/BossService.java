@@ -286,6 +286,7 @@ public class BossService {
         if (partial.getExpectedSalaryMax() != null) existing.setExpectedSalaryMax(partial.getExpectedSalaryMax());
 
         if (partial.getDeadStatus() != null) existing.setDeadStatus(partial.getDeadStatus());
+        if (partial.getHrActiveKeep() != null) existing.setHrActiveKeep(partial.getHrActiveKeep());
 
         existing.setUpdatedAt(now);
         bossConfigMapper.updateById(existing);
@@ -367,6 +368,8 @@ public class BossService {
 
         // HR不在线状态（括号列表字符串）
         config.setDeadStatus(parseListString(entity.getDeadStatus()));
+        // HR 活跃度白名单（括号列表字符串），非空时优先级高于 deadStatus 黑名单
+        config.setHrActiveKeep(parseListString(entity.getHrActiveKeep()));
 
         log.info("已从 boss_config 加载Boss配置，并完成括号列表解析");
         return config;

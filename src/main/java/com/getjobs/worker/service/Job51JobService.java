@@ -6,6 +6,8 @@ import com.getjobs.worker.job51.Job51;
 import com.getjobs.worker.job51.Job51Config;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.microsoft.playwright.Page;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,9 +35,11 @@ public class Job51JobService implements JobPlatformService {
     private volatile boolean isRunning = false;
     // 停止标志
     private volatile boolean shouldStop = false;
+    private volatile boolean shuttingDown;
 
     @Override
     public void executeDelivery(Consumer<JobProgressMessage> progressCallback) {
+        if (shuttingDown) return;
         if (isRunning) {
             progressCallback.accept(JobProgressMessage.warning(PLATFORM, "任务已在运行中"));
             return;
@@ -44,7 +48,7 @@ public class Job51JobService implements JobPlatformService {
         try {
             // 浏览器可能已被手动关闭 / 崩溃，先确保可用，必要时重新拉起
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
-            playwrightManager.ensureReady();
+            playwrightManager.ensurePlatformReady("51job");
 
             // 获取51job页面实例
             Page page = playwrightManager.getJob51Page();
@@ -60,6 +64,7 @@ public class Job51JobService implements JobPlatformService {
             }
 
             // 通过校验后再标记运行
+            if (shuttingDown) return;
             isRunning = true;
             shouldStop = false;
 
@@ -111,6 +116,12 @@ public class Job51JobService implements JobPlatformService {
                 playwrightManager.resume51jobMonitoring();
             } catch (Exception ignored) {}
         }
+    }
+
+    @EventListener(ContextClosedEvent.class)
+    public void stopOnShutdown() {
+        shuttingDown = true;
+        stopDelivery();
     }
 
     @Override

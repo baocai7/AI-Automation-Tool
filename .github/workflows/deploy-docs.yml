@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   deploy:
+    # 个人仓库上传源码时不自动发布站点；需要发布时可手动运行此工作流。
+    if: github.repository == 'loks666/get_jobs' || github.event_name == 'workflow_dispatch'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

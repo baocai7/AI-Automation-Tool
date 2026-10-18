@@ -36,6 +36,7 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setThreadNamePrefix("Boss-Task-");
         // 线程空闲时间（秒）
         executor.setKeepAliveSeconds(60);
+        executor.setAllowCoreThreadTimeOut(true);
         
         // 拒绝策略：由调用线程处理该任务
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());

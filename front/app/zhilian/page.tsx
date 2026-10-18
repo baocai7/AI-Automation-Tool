@@ -11,7 +11,7 @@ import { Select } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnalysisContent from '@/app/zhilian/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
-import { API_BASE } from '@/lib/api'
+import { API_BASE, openPlatform } from '@/lib/api'
 
 interface ZhilianConfig {
   id?: number
@@ -37,6 +37,14 @@ export default function ZhilianPage() {
   const [config, setConfig] = useState<ZhilianConfig>({ keywords: '', cityCode: '', salary: '' })
   const [options, setOptions] = useState<ZhilianOptions>({ city: [] })
   const [loadingConfig, setLoadingConfig] = useState(true)
+
+  useEffect(() => {
+    let active = true
+    openPlatform('zhilian').then(loggedIn => {
+      if (active) setIsLoggedIn(loggedIn)
+    }).catch(error => console.error('打开平台失败:', error))
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
