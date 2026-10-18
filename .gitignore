@@ -1,0 +1,8 @@
+.DS_Store
+.cache/
+.run/
+*.log
+Approver/Approver
+Approver/.cache/
+Approver/.run/
+Approver/*.log
