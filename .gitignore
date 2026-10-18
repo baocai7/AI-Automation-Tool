@@ -53,6 +53,8 @@ cookies/
 .env.*
 !.env.example
 /.tools/
+# 当前 GitHub 上传不包含 Actions，保留本地文件供之后按需启用。
+/.github/workflows/
 *.db-wal
 *.db-shm
 *.sqlite
